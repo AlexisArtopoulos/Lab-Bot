@@ -31,7 +31,6 @@ DATABASE_URL=postgresql://usuario:contraseña@localhost/fakestore_bot
 
 # Lista de Comandos:
 
-!pokemons: Muestra una lista de 10 Pokémon.
 
 !products: Lista todos los productos disponibles en la Fake Store API.
 

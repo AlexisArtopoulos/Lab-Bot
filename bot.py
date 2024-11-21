@@ -2,208 +2,217 @@ import discord
 import aiohttp
 import os
 import psycopg2
-
-from keep_alive import keep_alive
+from psycopg2 import OperationalError
 from dotenv import load_dotenv
 
+# Cargar variables de entorno
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# Conexión a la base de datos
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+except OperationalError as e:
+    print(f"Error connecting to database: {e}")
+    exit()
 
-#connection to db
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
-
-user_carts = {}
-
-# Need to check what intents are later
+# Configuración del bot
 intents = discord.Intents.default()
-intents.message_content = True 
+intents.message_content = True
 client = discord.Client(intents=intents)
 
+# Mensaje al iniciar el bot
 @client.event
 async def on_ready():
-    print("I'm in")
-    print(client.user)
+    print(f"Bot {client.user} is now running.")
 
-async def getPokemonListFromApi():
-    url = 'https://pokeapi.co/api/v2/pokemon?limit=10'
+# Funciones relacionadas con la base de datos
+async def add_user_to_db(user_id, username):
+    """Agrega un usuario a la base de datos si no existe."""
+    query = """
+    INSERT INTO users (user_id, username)
+    VALUES (%s, %s)
+    ON CONFLICT (user_id) DO NOTHING;
+    """
+    try:
+        cursor.execute(query, (user_id, username))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error adding user to database: {e}")
+
+async def get_or_create_cart(user_id):
+    """Obtiene o crea un carrito para el usuario."""
+    await add_user_to_db(user_id, "user")
+    query_cart = """
+    SELECT cart_id FROM carts WHERE user_id = %s;
+    """
+    cursor.execute(query_cart, (user_id,))
+    cart = cursor.fetchone()
+
+    if not cart:
+        query_create_cart = """
+        INSERT INTO carts (user_id) VALUES (%s) RETURNING cart_id;
+        """
+        cursor.execute(query_create_cart, (user_id,))
+        cart = cursor.fetchone()
+
+    conn.commit()
+    return cart[0]
+
+async def add_product_to_cart(user_id, product_id, product_info):
+    """Agrega un producto al carrito del usuario."""
+    cart_id = await get_or_create_cart(user_id)
+    query = """
+    INSERT INTO cart_items (cart_id, product_id, title, price, quantity)
+    VALUES (%s, %s, %s, %s, 1)
+    ON CONFLICT (cart_id, product_id) DO UPDATE SET quantity = cart_items.quantity + 1;
+    """
+    try:
+        cursor.execute(query, (cart_id, product_info['id'], product_info['title'], product_info['price']))
+        conn.commit()
+        return f"Product '{product_info['title']}' added to your cart."
+    except Exception as e:
+        conn.rollback()
+        print(f"Error adding product to cart: {e}")
+        return "Error adding product to cart."
+
+async def store_product_in_db(product):
+    """Guarda un producto en la base de datos."""
+    query = """
+    INSERT INTO cart_items (product_id, title, price)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (product_id) DO NOTHING;
+    """
+    try:
+        cursor.execute(query, (product['id'], product['title'], product['price']))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error storing product: {e}")
+
+async def get_cart_for_user(user_id):
+    """Obtiene los productos en el carrito de un usuario."""
+    cart_id = await get_or_create_cart(user_id)
+    query = """
+    SELECT title, price, quantity
+    FROM cart_items
+    WHERE cart_id = %s;
+    """
+    cursor.execute(query, (cart_id,))
+    items = cursor.fetchall()
+
+    if items:
+        return "\n".join([f"**Product:** {item[0]}, **Price:** ${item[1]}, **Quantity:** {item[2]}" for item in items])
+    else:
+        return "Your cart is empty."
+
+# Funciones relacionadas con la API
+async def fetch_product_from_api(product_id):
+    """Obtiene un producto de la Fake Store API por su ID."""
+    url = f"https://fakestoreapi.com/products/{product_id}"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                pokemon_names = [pokemon['name'] for pokemon in data['results']]
-                return '\n'.join(pokemon_names)
-            else:
-                return 'Error getting the list from Pokémons'
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return None
+        except aiohttp.ClientError as e:
+            print(f"Error fetching product: {e}")
+            return None
 
-
-
-# Obtain list of productss
-async def getProductListFromApi():
-    url = 'https://fakestoreapi.com/products'
+async def fetch_products_from_api():
+    """Obtiene todos los productos de la Fake Store API."""
+    url = "https://fakestoreapi.com/products"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                product_names = [product['title'] for product in data]
-                return '\n'.join(product_names)
-            else:
-                return 'Error getting the list of products'
-            
-# Obtain products by category         
-async def getProductsByCategory(category):
-    url = f'https://fakestoreapi.com/products/category/{category}'
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return []
+        except aiohttp.ClientError as e:
+            print(f"Error fetching products: {e}")
+            return []
+
+async def fetch_products_by_category(category):
+    """Obtiene productos de una categoría específica."""
+    url = f"https://fakestoreapi.com/products/category/{category}"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                product_names = [product['title'] for product in data]
-                return '\n'.join(product_names)
-            else:
-                return f'Error getting products from category {category}'
-            
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return []
+        except aiohttp.ClientError as e:
+            print(f"Error fetching category products: {e}")
+            return []
 
-
-# Add products to cart
-async def addToCart(user_id, product_id):
-    if user_id not in user_carts:
-        user_carts[user_id] = []
-
-    product_info = await getProductById(product_id)
-    if product_info != 'Error getting the product':
-        user_carts[user_id].append(product_info)
-        return f"Product {product_id} added to your cart!"
-    return product_info
-    
-            
-
-# Obtain specific product by Id
-async def getProductById(product_id):
-    url = f'https://fakestoreapi.com/products/{product_id}'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                product = await response.json()
-                return f"Product: {product['title']}\nPrice: ${product['price']}\nDescription: {product['description']}"
-            else:
-                return 'Error getting the product'
-
-# message event
+# Comandos del bot
 @client.event
 async def on_message(message):
     if message.author == client.user:
         return
-    if message.content.startswith('!pokemons'):
-        pokemon_list = await getPokemonListFromApi()
-        await message.channel.send(pokemon_list)
-    elif message.content.startswith('!products'):
-        product_list = await getProductListFromApi()
-        await message.channel.send(product_list)
-    elif message.content.startswith('!product'):
+
+    if message.content.startswith("!products"):
+        products = await fetch_products_from_api()
+        response = "\n".join([f"{product['id']}: {product['title']}" for product in products])
+        await message.channel.send(response if response else "No products found.")
+
+    elif message.content.startswith("!product"):
         try:
-            product_id = int(message.content.split()[1])  # Obtiene el ID del mensaje
-            product_info = await getProductById(product_id)
-            await message.channel.send(product_info)
+            product_id = int(message.content.split()[1])
+            product = await fetch_product_from_api(product_id)
+            if product:
+                await message.channel.send(f"**Product:** {product['title']}\n**Price:** ${product['price']}\n**Description:** {product['description']}")
+            else:
+                await message.channel.send("Product not found.")
         except (IndexError, ValueError):
             await message.channel.send("Please provide a valid product ID, e.g., `!product 1`.")
-    elif message.content.startswith('!category'):
+
+    elif message.content.startswith("!category"):
         try:
-            category = message.content.split()[1]  # Obtenemos la categoría
-            products = await getProductsByCategory(category)
-            await message.channel.send(products)
+            category = message.content.split()[1]
+            products = await fetch_products_by_category(category)
+            response = "\n".join([f"{product['id']}: {product['title']}" for product in products])
+            await message.channel.send(response if response else f"No products found in category '{category}'.")
         except IndexError:
             await message.channel.send("Please provide a valid category, e.g., `!category electronics`.")
-    elif message.content.startswith('!addtocart'):
+
+    elif message.content.startswith("!addtocart"):
         try:
             product_id = int(message.content.split()[1])
-            response = await addToCart(message.author.id, product_id)
-            await message.channel.send(response)
+            product = await fetch_product_from_api(product_id)
+            if product:
+                response = await add_product_to_cart(message.author.id, product_id, product)
+                await message.channel.send(response)
+            else:
+                await message.channel.send("Product not found.")
         except (IndexError, ValueError):
             await message.channel.send("Please provide a valid product ID, e.g., `!addtocart 1`.")
-    elif message.content.startswith('!cart'):
-        cart = user_carts.get(message.author.id, [])
-        if cart:
-            # Agregar separadores y un formato mejorado
-            formatted_cart = "\n".join([
-                f"**Product:** {product.splitlines()[0].split(': ', 1)[1]}\n"
-                f"**Price:** {product.splitlines()[1].split(': ', 1)[1]}\n"
-                f"**Description:** {product.splitlines()[2].split(': ', 1)[1]}\n"
-                f"——————————————"
-                for product in cart
-            ])
-            await message.channel.send(formatted_cart)
-        else:
-            await message.channel.send("Your cart is empty.")
-    elif message.content.startswith('!addtodb'):
+
+    elif message.content.startswith("!cart"):
+        response = await get_cart_for_user(message.author.id)
+        await message.channel.send(response)
+
+    elif message.content.startswith("!addtodb"):
         try:
             product_id = int(message.content.split()[1])
-            # Obtener el producto desde la Fake Store API
-            product_info = await getProductByIdForDB(product_id)
-            if product_info:
-                await storeProductInDb(product_info)
-                await message.channel.send(f"Product {product_info['title']} has been added to the database.")
+            product = await fetch_product_from_api(product_id)
+            if product:
+                await store_product_in_db(product)
+                await message.channel.send(f"Product '{product['title']}' added to the database.")
             else:
-                await message.channel.send(f"Error: Product with ID {product_id} not found.")
+                await message.channel.send("Product not found.")
         except (IndexError, ValueError):
             await message.channel.send("Please provide a valid product ID, e.g., `!addtodb 1`.")
 
-
-async def getProductByIdForDB(product_id):
-    url = f'https://fakestoreapi.com/products/{product_id}'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                product = await response.json()
-                return {
-                    'id': product['id'],
-                    'title': product['title'],
-                    'price': product['price'],
-                    'description': product['description']
-                }
-            else:
-                return None
-
-#store products in db
-async def storeProductInDb(product):
-    query = """
-    INSERT INTO products (product_id, title, price, description)
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT (product_id) DO NOTHING;
-    """
-    cursor.execute(query, (product['id'], product['title'], product['price'], product['description']))
-    conn.commit()
-
-
-async def fetchProductFromDb(product_id):
-    query = "SELECT title, price, description FROM products WHERE product_id = %s"
-    cursor.execute(query, (product_id,))
-    product = cursor.fetchone()
-    if product:
-        return f"Product: {product[0]}\nPrice: ${product[1]}\nDescription: {product[2]}"
-    else:
-        return 'Product not found in the database.'
-
-
-
-async def getProductListToDb():
-    url = 'https://fakestoreapi.com/products'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                products = await response.json()
-                for product in products:
-                    await storeProductInDb(product)
-                return products
-            else:
-                return 'Error fetching products'
-
-
-#keeps the bot alive with a webserver from Flask
-keep_alive()
-
-token = os.environ.get("BOT_TOKEN")
-if token:
-  client.run(token)
+# Iniciar el bot
+if BOT_TOKEN:
+    client.run(BOT_TOKEN)
 else:
-  print("Error: BOT_TOKEN .env variable not found.")
+    print("Error: BOT_TOKEN not found in .env.")
